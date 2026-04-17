@@ -1,46 +1,36 @@
 import psycopg2
 import requests
 import re
-import sys
 import time
+import traceback
 
-print(">>> INICIO DEL SISTEMA INTELIGENTE")
-
-# ---------------------------
-# CONFIG MODELOS
-# ---------------------------
-MODELO_SQL = "mistral"
-MODELO_RESPUESTA = "llama3"
+print(">>> SISTEMA DINÁMICO OPTIMIZADO")
 
 # ---------------------------
-# HISTORIAL (memoria simple)
+# CONFIG
 # ---------------------------
-historial = []
+URL_OLLAMA = "http://localhost:11434/api/generate"
+MODELO_SQL = "llama3"
+
+cache_sql = {}
 
 # ---------------------------
 # CONEXIÓN BD
 # ---------------------------
 def get_conn():
-    try:
-        return psycopg2.connect(
-            host="localhost",
-            database="empresa",
-            user="admin",
-            password="admin"
-        )
-    except Exception as e:
-        print("❌ Error BD:", e)
-        return None
+    return psycopg2.connect(
+        host="localhost",
+        database="empresa",
+        user="admin",
+        password="admin"
+    )
 
 # ---------------------------
 # EJECUTAR SQL
 # ---------------------------
 def ejecutar_sql(query):
-    conn = get_conn()
-    if conn is None:
-        return "error conexion"
-
     try:
+        conn = get_conn()
         cursor = conn.cursor()
         cursor.execute(query)
         res = cursor.fetchall()
@@ -51,200 +41,179 @@ def ejecutar_sql(query):
         return f"error sql: {e}"
 
 # ---------------------------
-# LLAMADA SEGURA A OLLAMA
+# OLLAMA
 # ---------------------------
-def llamar_ollama(modelo, prompt, temperature=0.2, max_tokens=150):
-    try:
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": modelo,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": temperature,
-                    "num_predict": max_tokens
-                }
+def llamar_ollama(prompt, temperature=0, max_tokens=25):
+    response = requests.post(
+        URL_OLLAMA,
+        json={
+            "model": MODELO_SQL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_predict": max_tokens
             }
-        )
-
-        data = response.json()
-
-        if "response" not in data:
-            return f"error llm: {data}"
-
-        return data["response"]
-
-    except Exception as e:
-        return f"error llm: {e}"
+        }
+    )
+    return response.json().get("response", "")
 
 # ---------------------------
 # LIMPIAR SQL
 # ---------------------------
 def limpiar_sql(sql):
-    sql = re.sub(r"```sql|```", "", sql).strip()
-    sql = sql.strip("'\"")
-    return sql.strip()
+    sql = re.sub(r"```sql|```", "", sql)
+
+    match = re.search(r"(SELECT[\s\S]*?;)", sql, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+
+    return sql.split("\n")[0].strip()
 
 # ---------------------------
-# VALIDACIÓN AVANZADA SQL
+# VALIDAR SQL BÁSICO
 # ---------------------------
 def validar_sql(sql):
-    sql_lower = sql.lower()
+    s = sql.lower()
 
-    if not sql_lower.startswith("select"):
-        return False, "Solo se permiten consultas SELECT"
+    if not s.startswith("select"):
+        return False
 
-    peligrosos = ["drop", "delete", "update", "insert", "alter"]
-    if any(p in sql_lower for p in peligrosos):
-        return False, "Consulta contiene operaciones no permitidas"
+    if "from" not in s:
+        return False
 
-    tablas_validas = ["clientes", "productos", "pedidos", "detalle_pedido"]
-    if not any(t in sql_lower for t in tablas_validas):
-        return False, "Consulta no usa tablas válidas"
+    if any(x in s for x in ["drop", "delete", "update", "insert", "alter"]):
+        return False
 
-    return True, "OK"
+    return True
 
 # ---------------------------
-# CLASIFICADOR DE INTENCIÓN
+# GENERAR SQL (CON CACHE)
 # ---------------------------
-def clasificar_intencion(pregunta):
+def generar_sql(pregunta):
+
+    if pregunta in cache_sql:
+        return cache_sql[pregunta]
+
     prompt = f"""
-Clasifica la intención:
+SQL PostgreSQL.
 
-Tipos:
-- conteo
-- listado
-- agregacion
-- detalle
+SOLO SQL.
+SIN texto.
+SIN explicación.
+TERMINA con ;
+
+IMPORTANTE:
+- Usa JOINs correctos
+- Incluye TODAS las tablas necesarias
+- NO omitas joins
+
+Esquema:
+clientes(id,nombre,ciudad,fecha_registro)
+productos(id,nombre,precio,categoria)
+pedidos(id,cliente_id,fecha)
+detalle_pedido(id,pedido_id,producto_id,cantidad)
+
+Relaciones:
+pedidos.cliente_id=clientes.id
+detalle_pedido.pedido_id=pedidos.id
+detalle_pedido.producto_id=productos.id
 
 Pregunta: {pregunta}
-Respuesta:
 """
-    return llamar_ollama("mistral", prompt, 0.1, 20)
+
+    sql = limpiar_sql(llamar_ollama(prompt))
+
+    cache_sql[pregunta] = sql
+
+    return sql
 
 # ---------------------------
-# GENERAR SQL
+# REGENERAR SQL (SIN CACHE)
 # ---------------------------
-def generar_sql(pregunta, intencion):
+def regenerar_sql(pregunta):
     prompt = f"""
-Genera SQL PostgreSQL.
+SQL PostgreSQL.
 
-Intención: {intencion}
+SOLO SQL.
+SIN explicación.
+SIN texto adicional.
+TERMINA con ;
 
-Tablas:
-clientes(id, nombre, ciudad, fecha_registro)
-productos(id, nombre, precio, categoria)
-pedidos(id, cliente_id, fecha)
-detalle_pedido(id, pedido_id, producto_id, cantidad)
-
-Reglas:
-- SOLO SQL
-- SOLO SELECT
-- SIN texto extra
+IMPORTANTE:
+- Usa JOINs correctos
+- Incluye TODAS las tablas necesarias
+- NO omitas joins
 
 Pregunta: {pregunta}
-SQL:
 """
-    return limpiar_sql(llamar_ollama(MODELO_SQL, prompt))
+
+    return limpiar_sql(llamar_ollama(prompt))
 
 # ---------------------------
-# REINTENTO
+# FORMATEAR RESPUESTA
 # ---------------------------
-def reintentar_sql(sql, error, pregunta):
-    prompt = f"""
-Corrige este SQL:
-
-{sql}
-
-Error:
-{error}
-
-Devuelve SOLO SQL válido.
-"""
-    nuevo_sql = limpiar_sql(llamar_ollama(MODELO_SQL, prompt))
-    return ejecutar_sql(nuevo_sql)
-
-# ---------------------------
-# RESPUESTA NATURAL
-# ---------------------------
-def generar_respuesta(pregunta, resultado):
-    prompt = f"""
-Explica el resultado de forma clara:
-
-Pregunta: {pregunta}
-Resultado: {resultado}
-
-Respuesta:
-"""
-    return llamar_ollama(MODELO_RESPUESTA, prompt, 0.4, 80)
-
-# ---------------------------
-# FORMATEO INTELIGENTE
-# ---------------------------
-def formatear_respuesta(pregunta, resultado):
+def formatear(resultado):
     if isinstance(resultado, str):
-        return "No pude procesar la consulta. Intenta reformularla."
+        return "❌ Error en consulta"
 
     if not resultado:
-        return "No se encontraron resultados."
+        return "Sin resultados"
 
     if len(resultado) == 1 and len(resultado[0]) == 1:
-        valor = resultado[0][0]
-        if "cuántos" in pregunta.lower():
-            return f"Hay {valor} registros."
-        return f"El resultado es {valor}."
+        return f"Resultado: {resultado[0][0]}"
 
-    return generar_respuesta(pregunta, resultado)
+    return "\n".join(str(r) for r in resultado[:5])
 
 # ---------------------------
-# MAIN LOOP
+# MAIN
 # ---------------------------
 if __name__ == "__main__":
-    print(">>> SISTEMA LISTO\n")
 
     while True:
         try:
-            pregunta = input("Pregunta (o 'salir'): ")
+            pregunta = input("\n❓ Pregunta: ")
 
             if pregunta.lower() == "salir":
                 break
 
             inicio = time.time()
 
-            # 1. intención
-            intencion = clasificar_intencion(pregunta)
-            print("🧭 Intención:", intencion)
+            # 1. generar SQL
+            sql = generar_sql(pregunta)
 
-            # 2. SQL
-            sql = generar_sql(pregunta, intencion)
-            print("\n🧠 SQL:\n", sql)
+            print("\n🧠 SQL generado:")
+            print("=" * 50)
+            print(sql)
+            print("=" * 50)
 
-            valido, msg = validar_sql(sql)
-            if not valido:
-                print("🚫", msg)
+            # 2. validar
+            if not validar_sql(sql):
+                print("❌ SQL inválido")
                 continue
 
             # 3. ejecutar
             resultado = ejecutar_sql(sql)
 
-            # 4. reintento si falla
+            # 🔥 4. REGENERACIÓN (NO CORRECCIÓN)
             if isinstance(resultado, str):
-                resultado = reintentar_sql(sql, resultado, pregunta)
+                print("⚠️ Reintentando generación SQL...")
+
+                sql = regenerar_sql(pregunta)
+
+                print("\n🔁 SQL nuevo:")
+                print("=" * 50)
+                print(sql)
+                print("=" * 50)
+
+                resultado = ejecutar_sql(sql)
 
             # 5. respuesta
-            respuesta = formatear_respuesta(pregunta, resultado)
+            print("\n💬 Resultado:")
+            print(formatear(resultado))
 
-            # 6. guardar historial
-            historial.append({
-                "pregunta": pregunta,
-                "sql": sql
-            })
-
-            fin = time.time()
-
-            print("\n💬 Respuesta:\n", respuesta)
-            print(f"\n⏱ Tiempo: {fin - inicio:.2f}s")
+            print(f"\n⏱ Tiempo: {time.time() - inicio:.2f}s")
 
         except Exception as e:
             print("❌ Error:", e)
+            traceback.print_exc()

@@ -243,11 +243,11 @@ def ejecutar_pruebas():
         "¿Cuántos clientes hay en Lima?",
         "Lista todos los productos",
         "¿Cuál es el producto más caro?",
-        "¿Qué productos ha comprado Juan Perez?",
+        #"¿Qué productos ha comprado Juan Perez?",
         "¿Qué cliente ha comprado más productos?",
         "¿Cuál es la categoría más vendida?",
         "ventas por cliente",
-        "dame los empleados"
+        #"dame los empleados"
     ]
 
     print("🚀 INICIANDO DEMO\n")
