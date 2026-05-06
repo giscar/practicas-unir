@@ -1,4 +1,7 @@
 import re
+import os
+import sqlite3
+import time
 import psycopg2
 import requests
 
@@ -6,10 +9,12 @@ from db_setup import SCHEMA_DESCRIPTION, SCHEMA_TABLES, construir_contexto_esque
 
 
 URL_OLLAMA = "http://localhost:11434/api/generate"
-MODELO_SQL = "qwen2.5-coder:1.5b"
-MODELO_RESPUESTA = "llama3"
-MAX_INTENTOS = 3
-TIMEOUT_OLLAMA = 60
+MODELO_SQL = os.getenv("MODELO_SQL", "qwen2.5-coder:1.5b")
+MODELO_RESPUESTA = os.getenv("MODELO_RESPUESTA", "llama3")
+MAX_INTENTOS = int(os.getenv("MAX_INTENTOS", "2"))
+TIMEOUT_OLLAMA = int(os.getenv("TIMEOUT_OLLAMA", "60"))
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+SQL_CACHE_DB = os.getenv("SQL_CACHE_DB", "cache_sql.sqlite3")
 
 cache_sql = {}
 
@@ -25,6 +30,148 @@ Valores conocidos:
 - pagos.estado: pagado, pendiente, rechazado
 - pagos.metodo: tarjeta, transferencia, yape, plin, efectivo
 """
+
+
+def normalizar_clave_pregunta(pregunta):
+    return re.sub(r"\s+", " ", pregunta.strip().lower())
+
+
+def init_cache_persistente():
+    conn = sqlite3.connect(SQL_CACHE_DB)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sql_cache (
+                pregunta TEXT PRIMARY KEY,
+                sql TEXT NOT NULL,
+                modelo TEXT NOT NULL,
+                origen TEXT NOT NULL,
+                contexto TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                used_count INTEGER DEFAULT 0
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def leer_cache_persistente(pregunta):
+    init_cache_persistente()
+    conn = sqlite3.connect(SQL_CACHE_DB)
+    try:
+        cursor = conn.execute(
+            "SELECT sql, modelo, origen, contexto FROM sql_cache WHERE pregunta = ?",
+            (normalizar_clave_pregunta(pregunta),)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        conn.execute(
+            "UPDATE sql_cache SET used_count = used_count + 1 WHERE pregunta = ?",
+            (normalizar_clave_pregunta(pregunta),)
+        )
+        conn.commit()
+
+        return {
+            "sql": row[0],
+            "modelo": row[1],
+            "origen": row[2],
+            "contexto": row[3] or ""
+        }
+    finally:
+        conn.close()
+
+
+def guardar_cache_persistente(pregunta, sql, origen, contexto):
+    init_cache_persistente()
+    conn = sqlite3.connect(SQL_CACHE_DB)
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO sql_cache (pregunta, sql, modelo, origen, contexto, used_count)
+            VALUES (?, ?, ?, ?, ?, COALESCE(
+                (SELECT used_count FROM sql_cache WHERE pregunta = ?),
+                0
+            ))
+            """,
+            (
+                normalizar_clave_pregunta(pregunta),
+                sql,
+                MODELO_SQL,
+                origen,
+                contexto,
+                normalizar_clave_pregunta(pregunta)
+            )
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def guardar_correccion_usuario(pregunta, sql):
+    sql_limpio = eliminar_joins_no_usados(normalizar_aliases_sql(limpiar_sql(sql)))
+    ok, error = validar_sql_detallado(pregunta, sql_limpio)
+
+    if not ok:
+        return {
+            "ok": False,
+            "error": error,
+            "sql": sql_limpio
+        }
+
+    resultado = ejecutar_sql(sql_limpio)
+    if isinstance(resultado, str):
+        return {
+            "ok": False,
+            "error": resultado,
+            "sql": sql_limpio
+        }
+
+    contexto = construir_contexto_esquema(pregunta)
+    origen = "Corrección supervisada"
+    cache_sql[normalizar_clave_pregunta(pregunta)] = {
+        "sql": sql_limpio,
+        "origen": origen,
+        "contexto": contexto
+    }
+    guardar_cache_persistente(pregunta, sql_limpio, origen, contexto)
+
+    return {
+        "ok": True,
+        "sql": sql_limpio,
+        "filas": len(resultado["filas"]),
+        "columnas": resultado["columnas"]
+    }
+
+
+def limpiar_cache_persistente():
+    init_cache_persistente()
+    conn = sqlite3.connect(SQL_CACHE_DB)
+    try:
+        conn.execute("DELETE FROM sql_cache")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def invalidar_cache_persistente(pregunta):
+    init_cache_persistente()
+    conn = sqlite3.connect(SQL_CACHE_DB)
+    try:
+        conn.execute(
+            "DELETE FROM sql_cache WHERE pregunta = ?",
+            (normalizar_clave_pregunta(pregunta),)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def calentar_modelo():
+    return llamar_ollama("Responde SOLO: SELECT 1;", max_tokens=8)
 
 
 def columnas_por_tabla():
@@ -63,11 +210,22 @@ def ejecutar_sql(query):
         cursor.execute("SET statement_timeout = 8000")
         cursor.execute(query)
         res = cursor.fetchall()
+        columnas = [desc[0] for desc in cursor.description] if cursor.description else []
         cursor.close()
         conn.close()
-        return res
+        return {
+            "filas": res,
+            "columnas": columnas
+        }
     except Exception as e:
         return f"error sql: {e}"
+
+
+def ejecutar_sql_simple(query):
+    resultado = ejecutar_sql(query)
+    if isinstance(resultado, str):
+        return resultado
+    return resultado["filas"]
 
 
 def llamar_ollama(prompt, temperature=0, max_tokens=160):
@@ -79,7 +237,7 @@ def llamar_ollama(prompt, temperature=0, max_tokens=160):
                 "model": MODELO_SQL,
                 "prompt": prompt,
                 "stream": False,
-                "keep_alive": "5m",
+                "keep_alive": OLLAMA_KEEP_ALIVE,
                 "options": {
                     "temperature": temperature,
                     "num_predict": max_tokens,
@@ -104,7 +262,7 @@ def llamar_ollama_modelo(modelo, prompt, temperature=0.2, max_tokens=120):
                 "model": modelo,
                 "prompt": prompt,
                 "stream": False,
-                "keep_alive": "5m",
+                "keep_alive": OLLAMA_KEEP_ALIVE,
                 "options": {
                     "temperature": temperature,
                     "num_predict": max_tokens,
@@ -155,6 +313,23 @@ def normalizar_aliases_sql(sql):
         sql = re.sub(r"\bp\.", "pe.", sql)
 
     return sql
+
+
+def eliminar_joins_no_usados(sql):
+    patron_join = re.compile(
+        r"\s+JOIN\s+([a-z_][a-z0-9_]*)\s+([a-z_][a-z0-9_]*)\s+ON\s+[\s\S]*?(?=\s+(?:JOIN|WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT)|;)",
+        re.IGNORECASE
+    )
+
+    sql_limpio = sql
+    for match in list(patron_join.finditer(sql)):
+        alias = match.group(2)
+        resto_sql = sql_limpio.replace(match.group(0), " ")
+
+        if not re.search(rf"\b{alias}\.", resto_sql, re.IGNORECASE):
+            sql_limpio = sql_limpio.replace(match.group(0), " ")
+
+    return re.sub(r"\n\s*\n", "\n", sql_limpio).strip()
 
 
 def validar_sql_basico(sql):
@@ -250,6 +425,17 @@ def validar_sql_negocio(pregunta, sql):
         if "pagos" not in sql_limpio or "monto" not in sql_limpio or "sum(" not in sql_limpio:
             return False, "Para montos de pago usa pagos.monto y SUM."
 
+    if (
+        "pedido" in pregunta_limpia
+        and ("canal" in pregunta_limpia or "estado" in pregunta_limpia)
+        and "pago" not in pregunta_limpia
+        and "monto" not in pregunta_limpia
+    ):
+        if "pedidos" not in sql_limpio or "count(" not in sql_limpio:
+            return False, "Pedidos por canal/estado debe usar pedidos y COUNT."
+        if "pagos" in sql_limpio:
+            return False, "No filtres por pagos cuando la pregunta solo pide pedidos."
+
     if "stock" in pregunta_limpia and "minimo" in pregunta_limpia:
         if "stock_minimo" not in sql_limpio:
             return False, "Para stock bajo compara inventario.stock con inventario.stock_minimo."
@@ -285,6 +471,8 @@ Error detectado:
 {error_previo}
 """
 
+    metricas = metricas_para_pregunta(pregunta)
+
     return f"""
 Eres un generador de SQL PostgreSQL para analítica empresarial.
 
@@ -298,6 +486,7 @@ Reglas estrictas:
 - No uses valores que no existan en la lista de valores conocidos.
 - No uses INSERT, UPDATE, DELETE, DROP, CREATE, ALTER ni TRUNCATE.
 - Usa alias claros: c=clientes, pe=pedidos, dp=detalle_pedido, pr=productos, ca=categorias, e=empleados, pa=pagos.
+- Usa alias de salida descriptivos en snake_case, por ejemplo cantidad_pedidos, ventas_totales, margen_total.
 - Nunca uses p como alias.
 - Nunca uses pe.nombre: pedidos no tiene columna nombre.
 - Nunca uses pe.metodo ni pe.monto: metodo y monto están en pagos pa.
@@ -305,10 +494,8 @@ Reglas estrictas:
 - Si preguntas por clientes, clientes.nombre/ciudad/segmento están en clientes.
 - Si preguntas por top o ranking, usa ORDER BY y LIMIT.
 
-Métricas obligatorias:
-- ventas = dp.cantidad * dp.precio_unitario * (1 - dp.descuento)
-- margen = ventas - dp.cantidad * pr.costo
-- stock bajo = i.stock < i.stock_minimo
+Métricas relevantes:
+{metricas}
 
 {VALORES_NEGOCIO}
 
@@ -321,6 +508,31 @@ SQL:
 """.strip()
 
 
+def metricas_para_pregunta(pregunta):
+    p = pregunta.lower()
+    metricas = []
+
+    if "venta" in p or "ventas" in p:
+        metricas.append("- ventas = dp.cantidad * dp.precio_unitario * (1 - dp.descuento)")
+
+    if "margen" in p:
+        metricas.append("- margen = ventas - dp.cantidad * pr.costo")
+
+    if "stock" in p:
+        metricas.append("- stock bajo = i.stock < i.stock_minimo")
+
+    if "pago" in p or "monto" in p:
+        metricas.append("- monto vendido por metodo = SUM(pa.monto)")
+
+    if "pedido" in p and ("canal" in p or "estado" in p) and "pago" not in p:
+        metricas.append("- pedidos por canal/estado = COUNT(*) desde pedidos pe, sin unir pagos")
+
+    if not metricas:
+        metricas.append("- conteos = COUNT(*)")
+
+    return "\n".join(metricas)
+
+
 def generar_sql_modelo(pregunta, contexto_esquema, sql_previo=None, error_previo=None):
     prompt = construir_prompt_sql(
         pregunta,
@@ -329,7 +541,9 @@ def generar_sql_modelo(pregunta, contexto_esquema, sql_previo=None, error_previo
         error_previo=error_previo
     )
     respuesta = llamar_ollama(prompt)
-    return normalizar_aliases_sql(limpiar_sql(respuesta)), respuesta
+    sql = normalizar_aliases_sql(limpiar_sql(respuesta))
+    sql = eliminar_joins_no_usados(sql)
+    return sql, respuesta
 
 
 def generar_sql(pregunta):
@@ -372,35 +586,84 @@ Respuesta:
     return llamar_ollama_modelo(MODELO_RESPUESTA, prompt, 0.3, 90).strip()
 
 
-def procesar_pregunta(pregunta):
-    pregunta_cache = pregunta.strip().lower()
+def procesar_pregunta(pregunta, forzar_ia=False):
+    pregunta_cache = normalizar_clave_pregunta(pregunta)
 
-    if pregunta_cache in cache_sql:
+    if not forzar_ia and pregunta_cache in cache_sql:
         metadata = cache_sql[pregunta_cache]
-        resultado_cache = ejecutar_sql(metadata["sql"])
+        ok_cache, _ = validar_sql_detallado(pregunta, metadata["sql"])
 
-        if not isinstance(resultado_cache, str):
-            return {
-                "ok": True,
-                "sql": metadata["sql"],
-                "resultado": resultado_cache,
-                "origen": f"{metadata['origen']} cache"
-            }
+        if ok_cache:
+            resultado_cache = ejecutar_sql(metadata["sql"])
+
+            if not isinstance(resultado_cache, str):
+                return {
+                    "ok": True,
+                    "sql": metadata["sql"],
+                    "resultado": resultado_cache["filas"],
+                    "columnas": resultado_cache["columnas"],
+                    "origen": f"{metadata['origen']} cache",
+                    "tiempos": {
+                        "generacion_sql": 0,
+                        "validacion": 0,
+                        "ejecucion_bd": 0,
+                    },
+                    "validaciones": ["Cache SQL", "Consulta SELECT", "Columnas válidas", "Ejecución PostgreSQL"]
+                }
+        else:
+            cache_sql.pop(pregunta_cache, None)
+
+    if not forzar_ia:
+        metadata_persistente = leer_cache_persistente(pregunta)
+
+        if metadata_persistente:
+            ok_cache, _ = validar_sql_detallado(pregunta, metadata_persistente["sql"])
+
+            if ok_cache:
+                resultado_cache = ejecutar_sql(metadata_persistente["sql"])
+
+                if not isinstance(resultado_cache, str):
+                    cache_sql[pregunta_cache] = metadata_persistente
+                    return {
+                        "ok": True,
+                        "sql": metadata_persistente["sql"],
+                        "resultado": resultado_cache["filas"],
+                        "columnas": resultado_cache["columnas"],
+                        "origen": f"{metadata_persistente['origen']} memoria",
+                        "tiempos": {
+                            "generacion_sql": 0,
+                            "validacion": 0,
+                            "ejecucion_bd": 0,
+                        },
+                        "validaciones": ["Memoria SQL", "Consulta SELECT", "Columnas válidas", "Ejecución PostgreSQL"]
+                    }
+            else:
+                invalidar_cache_persistente(pregunta)
 
     contexto_esquema = construir_contexto_esquema(pregunta)
     sql_actual = None
     error_actual = None
     metadata = None
+    tiempos = {
+        "generacion_sql": 0,
+        "validacion": 0,
+        "ejecucion_bd": 0,
+    }
+    validaciones_ok = []
 
     for intento in range(1, MAX_INTENTOS + 1):
+        inicio_generacion = time.time()
         sql_actual, respuesta_modelo = generar_sql_modelo(
             pregunta,
             contexto_esquema,
             sql_previo=sql_actual,
             error_previo=error_actual
         )
+        tiempos["generacion_sql"] += time.time() - inicio_generacion
 
+        inicio_validacion = time.time()
         ok, error_validacion = validar_sql_detallado(pregunta, sql_actual)
+        tiempos["validacion"] += time.time() - inicio_validacion
         metadata = {
             "sql": sql_actual,
             "origen": f"IA ({MODELO_SQL}) intento {intento}",
@@ -413,7 +676,15 @@ def procesar_pregunta(pregunta):
             continue
 
         try:
+            validaciones_ok = [
+                "Consulta SELECT segura",
+                "Tablas y columnas válidas",
+                "Reglas de negocio verificadas",
+            ]
+
+            inicio_bd = time.time()
             resultado = ejecutar_sql(sql_actual)
+            tiempos["ejecucion_bd"] += time.time() - inicio_bd
 
             if isinstance(resultado, str) and "error sql" in resultado:
                 raise Exception(resultado)
@@ -423,12 +694,21 @@ def procesar_pregunta(pregunta):
                 "origen": f"IA ({MODELO_SQL})",
                 "contexto": contexto_esquema
             }
+            guardar_cache_persistente(
+                pregunta,
+                sql_actual,
+                f"IA ({MODELO_SQL})",
+                contexto_esquema
+            )
 
             return {
                 "ok": True,
                 "sql": sql_actual,
-                "resultado": resultado,
-                "origen": metadata["origen"]
+                "resultado": resultado["filas"],
+                "columnas": resultado["columnas"],
+                "origen": metadata["origen"],
+                "tiempos": {k: round(v, 2) for k, v in tiempos.items()},
+                "validaciones": [*validaciones_ok, "Ejecución PostgreSQL"]
             }
 
         except Exception as e:
@@ -438,5 +718,7 @@ def procesar_pregunta(pregunta):
         "ok": False,
         "error": error_actual or "No se pudo generar SQL válido.",
         "sql": sql_actual or "",
-        "origen": metadata["origen"] if metadata else f"IA ({MODELO_SQL})"
+        "origen": metadata["origen"] if metadata else f"IA ({MODELO_SQL})",
+        "tiempos": {k: round(v, 2) for k, v in tiempos.items()},
+        "validaciones": validaciones_ok
     }
