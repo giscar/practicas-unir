@@ -185,6 +185,33 @@ def cargar_datos():
     print("\n📦 Cargando datos...")
 
     sql = """
+    CREATE TABLE IF NOT EXISTS clientes (
+        id INTEGER PRIMARY KEY,
+        nombre TEXT NOT NULL,
+        ciudad TEXT NOT NULL,
+        fecha_registro DATE NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS productos (
+        id INTEGER PRIMARY KEY,
+        nombre TEXT NOT NULL,
+        precio NUMERIC NOT NULL,
+        categoria TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS pedidos (
+        id INTEGER PRIMARY KEY,
+        cliente_id INTEGER NOT NULL REFERENCES clientes(id),
+        fecha DATE NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS detalle_pedido (
+        id INTEGER PRIMARY KEY,
+        pedido_id INTEGER NOT NULL REFERENCES pedidos(id),
+        producto_id INTEGER NOT NULL REFERENCES productos(id),
+        cantidad INTEGER NOT NULL
+    );
+
     DELETE FROM detalle_pedido;
     DELETE FROM pedidos;
     DELETE FROM productos;
