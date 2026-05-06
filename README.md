@@ -249,7 +249,7 @@ Por eso el diseño no confía ciegamente en el modelo. El LLM propone; el sistem
 
 ### 4.4 Por Qué No Foundry Local en Esta Versión
 
-Foundry Local es una alternativa interesante para inferencia local. Según la documentación de Microsoft, está orientado a aplicaciones on-device, usa un catálogo curado de modelos, SDKs y ONNX Runtime, con aceleración automática cuando el hardware lo permite.
+Foundry Local es una alternativa interesante para inferencia local. Según la documentación de Microsoft.
 
 Sin embargo, para este proyecto se eligió Ollama por razones prácticas:
 
@@ -270,11 +270,10 @@ Sin embargo, para este proyecto se eligió Ollama por razones prácticas:
    ollama serve
    ```
 
-5. **Foundry Local está orientado a producto embebido**
-   Foundry Local es fuerte para aplicaciones finales que empaquetan inferencia local dentro de la app. Este proyecto, en cambio, es un prototipo analítico con servidor local, PostgreSQL y Streamlit.
-
-6. **Foundry Local aún está en preview**
+5. **Foundry Local aún está en preview**
    La documentación indica que Foundry Local está en preview, por lo que APIs o comportamientos podrían cambiar antes de GA.
+
+6. ***Foundry Local no se puedee instalar en sistemas operativos Apple Intel, Ni en linux x64, soporta windows empresarial y Apple Silicon.
 
 Conclusión:
 
