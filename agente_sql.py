@@ -11,7 +11,7 @@ from db_setup import SCHEMA_DESCRIPTION, SCHEMA_TABLES, construir_contexto_esque
 URL_OLLAMA = "http://localhost:11434/api/generate"
 MODELO_SQL = os.getenv("MODELO_SQL", "qwen2.5-coder:1.5b")
 MODELO_RESPUESTA = os.getenv("MODELO_RESPUESTA", "llama3")
-MAX_INTENTOS = int(os.getenv("MAX_INTENTOS", "2"))
+MAX_INTENTOS = int(os.getenv("MAX_INTENTOS", "3"))
 TIMEOUT_OLLAMA = int(os.getenv("TIMEOUT_OLLAMA", "60"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 SQL_CACHE_DB = os.getenv("SQL_CACHE_DB", "cache_sql.sqlite3")
@@ -29,6 +29,29 @@ Valores conocidos:
 - pedidos.canal: Web, App, Tienda, Call Center, Marketplace
 - pagos.estado: pagado, pendiente, rechazado
 - pagos.metodo: tarjeta, transferencia, yape, plin, efectivo
+"""
+
+DICCIONARIO_DATOS = """
+Diccionario de datos de negocio:
+- clientes: personas o empresas que compran. Usa c.nombre para identificar cliente.
+- pedidos: cabecera comercial/logística del pedido. Canal, estado, fecha, cliente, empleado y sucursal viven aquí.
+- detalle_pedido: líneas del pedido. Úsala para ventas de productos, cantidades, descuentos y margen.
+- productos: catálogo. pr.precio es precio de lista; pr.costo sirve para margen.
+- categorias: agrupación de productos.
+- empleados: vendedor o responsable asociado al pedido.
+- sucursales: tienda/sede asociada al pedido o inventario.
+- pagos: pagos realizados por pedido. pa.monto es dinero pagado; pa.metodo es método de pago.
+- inventario: stock por producto y sucursal.
+
+Reglas semánticas:
+- ingresos/facturación/monto cobrado = SUM(pa.monto) desde pagos pa con pa.estado = 'pagado'.
+- ventas = SUM(dp.cantidad * dp.precio_unitario * (1 - dp.descuento)).
+- margen = SUM(dp.cantidad * ((dp.precio_unitario * (1 - dp.descuento)) - pr.costo)).
+- pedidos por canal/estado = COUNT(*) desde pedidos pe, sin unir pagos salvo que la pregunta hable de pagos o montos.
+- pagos se une con pedidos mediante pa.pedido_id = pe.id.
+- detalle_pedido se une con pedidos mediante dp.pedido_id = pe.id.
+- detalle_pedido se une con productos mediante dp.producto_id = pr.id.
+- No existe dp.pagamento_id, dp.pago_id, pe.monto, pe.metodo ni pe.nombre.
 """
 
 
@@ -112,7 +135,7 @@ def guardar_cache_persistente(pregunta, sql, origen, contexto):
 
 
 def guardar_correccion_usuario(pregunta, sql):
-    sql_limpio = eliminar_joins_no_usados(normalizar_aliases_sql(limpiar_sql(sql)))
+    sql_limpio = preparar_sql_para_pregunta(pregunta, sql)
     ok, error = validar_sql_detallado(pregunta, sql_limpio)
 
     if not ok:
@@ -299,6 +322,9 @@ def limpiar_sql(sql):
 def normalizar_aliases_sql(sql):
     aliases = extraer_aliases(sql)
 
+    sql = re.sub(r"\bpe\.pa\.", "pa.", sql)
+    sql = re.sub(r"\bp\.pa\.", "pa.", sql)
+
     if aliases.get("p") == "pedidos":
         sql = re.sub(r"\bpedidos\s+p\b", "pedidos pe", sql, flags=re.IGNORECASE)
         sql = re.sub(r"\bp\.", "pe.", sql)
@@ -311,6 +337,40 @@ def normalizar_aliases_sql(sql):
 
     if "pe" in aliases and "p" not in aliases:
         sql = re.sub(r"\bp\.", "pe.", sql)
+
+    return sql
+
+
+def reparar_errores_comunes_sql(sql):
+    if not sql:
+        return sql
+
+    sql = re.sub(r"\bpe\.pa\.", "pa.", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bp\.pa\.", "pa.", sql, flags=re.IGNORECASE)
+    sql = re.sub(
+        r"JOIN\s+pagos\s+pa\s+ON\s+dp\.(?:pagamento_id|pago_id)\s*=\s*pa\.id",
+        "JOIN pagos pa ON pe.id = pa.pedido_id",
+        sql,
+        flags=re.IGNORECASE
+    )
+    sql = re.sub(
+        r"JOIN\s+pagos\s+pa\s+ON\s+pa\.id\s*=\s+dp\.(?:pagamento_id|pago_id)",
+        "JOIN pagos pa ON pa.pedido_id = pe.id",
+        sql,
+        flags=re.IGNORECASE
+    )
+    sql = re.sub(
+        r"SUM\s*\(\s*pa\.metodo\s*=\s*'[^']+'\s+AND\s+pa\.monto\s*>\s*0\s*\)",
+        "SUM(pa.monto)",
+        sql,
+        flags=re.IGNORECASE
+    )
+    sql = re.sub(
+        r"SUM\s*\(\s*pa\.monto\s*>\s*0\s+AND\s+pa\.metodo\s*=\s*'[^']+'\s*\)",
+        "SUM(pa.monto)",
+        sql,
+        flags=re.IGNORECASE
+    )
 
     return sql
 
@@ -330,6 +390,72 @@ def eliminar_joins_no_usados(sql):
             sql_limpio = sql_limpio.replace(match.group(0), " ")
 
     return re.sub(r"\n\s*\n", "\n", sql_limpio).strip()
+
+
+def pregunta_pide_ranking(pregunta):
+    pregunta_limpia = pregunta.lower()
+    return any(
+        palabra in pregunta_limpia
+        for palabra in ["top", "más", "mas", "mayor", "mayores", "mejor", "mejores"]
+    )
+
+
+def alias_metrica_principal(sql):
+    match_select = re.search(r"\bselect\b([\s\S]+?)\bfrom\b", sql, re.IGNORECASE)
+    if not match_select:
+        return None
+
+    aliases = re.findall(
+        r"\b(?:sum|count|avg|min|max)\s*\([\s\S]*?\)\s+as\s+([a-z_][a-z0-9_]*)",
+        match_select.group(1),
+        flags=re.IGNORECASE
+    )
+    if not aliases:
+        aliases = re.findall(
+            r"\bas\s+([a-z_][a-z0-9_]*)",
+            match_select.group(1),
+            flags=re.IGNORECASE
+        )
+
+    prioridades = [
+        "rentabilidad", "margen", "utilidad", "ventas", "ingresos",
+        "facturacion", "monto", "total", "cantidad", "conteo"
+    ]
+
+    for prioridad in prioridades:
+        for alias in aliases:
+            if prioridad in alias.lower():
+                return alias
+
+    return aliases[-1] if aliases else None
+
+
+def aplicar_reglas_intencion(pregunta, sql):
+    sql_limpio = sql.strip()
+
+    if pregunta_pide_ranking(pregunta) and "order by" not in sql_limpio.lower():
+        alias = alias_metrica_principal(sql_limpio)
+        if alias:
+            sql_limpio = re.sub(r";\s*$", "", sql_limpio)
+            sql_limpio = f"{sql_limpio}\nORDER BY {alias} DESC;"
+
+    if "top" in pregunta.lower() and "limit" not in sql_limpio.lower():
+        sql_limpio = re.sub(r";\s*$", "", sql_limpio)
+        sql_limpio = f"{sql_limpio}\nLIMIT 5;"
+
+    return sql_limpio
+
+
+def sanitizar_sql(sql):
+    sql_limpio = limpiar_sql(sql)
+    sql_limpio = reparar_errores_comunes_sql(sql_limpio)
+    sql_limpio = normalizar_aliases_sql(sql_limpio)
+    sql_limpio = reparar_errores_comunes_sql(sql_limpio)
+    return eliminar_joins_no_usados(sql_limpio)
+
+
+def preparar_sql_para_pregunta(pregunta, sql):
+    return aplicar_reglas_intencion(pregunta, sanitizar_sql(sql))
 
 
 def validar_sql_basico(sql):
@@ -406,6 +532,14 @@ def validar_tablas_y_columnas(sql):
 def validar_sql_negocio(pregunta, sql):
     pregunta_limpia = pregunta.lower()
     sql_limpio = sql.lower()
+    pide_rentabilidad = any(
+        palabra in pregunta_limpia
+        for palabra in ["margen", "rentable", "rentables", "rentabilidad"]
+    )
+    pide_cobros = any(
+        palabra in pregunta_limpia
+        for palabra in ["facturacion", "facturación", "cobrado", "cobrados", "recaudado", "recaudacion", "recaudación"]
+    ) or ("ingreso" in pregunta_limpia and ("pago" in pregunta_limpia or "pagado" in pregunta_limpia))
 
     if "venta" in pregunta_limpia or "ventas" in pregunta_limpia:
         if "detalle_pedido" not in sql_limpio or "sum(" not in sql_limpio:
@@ -413,17 +547,27 @@ def validar_sql_negocio(pregunta, sql):
         if "cantidad" not in sql_limpio or "precio_unitario" not in sql_limpio:
             return False, "Ventas debe calcularse con cantidad y precio_unitario."
 
-    if "margen" in pregunta_limpia:
+    if pide_rentabilidad:
         if "costo" not in sql_limpio or "sum(" not in sql_limpio:
-            return False, "Margen debe usar productos.costo y SUM."
+            return False, "Rentabilidad/margen debe usar productos.costo y SUM."
 
     if "top" in pregunta_limpia:
         if "order by" not in sql_limpio or "limit" not in sql_limpio:
             return False, "Las preguntas top/ranking deben usar ORDER BY y LIMIT."
 
+    if any(palabra in pregunta_limpia for palabra in ["más", "mas", "mayor", "mayores", "mejor", "mejores"]):
+        if "order by" not in sql_limpio:
+            return False, "Las preguntas de ranking deben ordenar el resultado con ORDER BY."
+
     if "monto" in pregunta_limpia and "pago" in pregunta_limpia:
         if "pagos" not in sql_limpio or "monto" not in sql_limpio or "sum(" not in sql_limpio:
             return False, "Para montos de pago usa pagos.monto y SUM."
+
+    if pide_cobros and not pide_rentabilidad:
+        if "pagos" not in sql_limpio or "pa.monto" not in sql_limpio or "sum(" not in sql_limpio:
+            return False, "Cobros/facturación debe usar pagos.monto con SUM."
+        if "pa.estado" not in sql_limpio or "pagado" not in sql_limpio:
+            return False, "Cobros/facturación debe filtrar pagos confirmados con pa.estado = 'pagado'."
 
     if (
         "pedido" in pregunta_limpia
@@ -499,6 +643,8 @@ Métricas relevantes:
 
 {VALORES_NEGOCIO}
 
+{DICCIONARIO_DATOS}
+
 {contexto_esquema}
 
 {bloque_correccion}
@@ -508,21 +654,70 @@ SQL:
 """.strip()
 
 
+def construir_prompt_corrector(pregunta, contexto_esquema, sql_fallido, error_detectado):
+    metricas = metricas_para_pregunta(pregunta)
+
+    return f"""
+Eres un corrector experto de SQL PostgreSQL para un agente analítico.
+
+Tu tarea es reparar una consulta fallida. Devuelve SOLO una consulta SQL válida.
+
+Reglas:
+- Responde únicamente SQL, sin explicación ni markdown.
+- Mantén la intención de la pregunta original.
+- Usa únicamente tablas y columnas del esquema.
+- Corrige joins, aliases, columnas inexistentes y métricas mal calculadas.
+- La consulta debe empezar con SELECT y terminar con punto y coma.
+- No uses INSERT, UPDATE, DELETE, DROP, CREATE, ALTER ni TRUNCATE.
+- Usa aliases: c=clientes, pe=pedidos, dp=detalle_pedido, pr=productos, ca=categorias, e=empleados, s=sucursales, pa=pagos, i=inventario.
+- No uses p como alias.
+- Usa aliases de salida en snake_case y entendibles.
+
+Métricas relevantes:
+{metricas}
+
+{VALORES_NEGOCIO}
+
+{DICCIONARIO_DATOS}
+
+{contexto_esquema}
+
+Pregunta original:
+{pregunta}
+
+SQL fallido:
+{sql_fallido}
+
+Error detectado:
+{error_detectado}
+
+SQL corregido:
+""".strip()
+
+
 def metricas_para_pregunta(pregunta):
     p = pregunta.lower()
     metricas = []
+    pide_rentabilidad = any(palabra in p for palabra in ["margen", "rentable", "rentables", "rentabilidad"])
+    pide_cobros = any(
+        palabra in p
+        for palabra in ["facturacion", "facturación", "cobrado", "cobrados", "recaudado", "recaudacion", "recaudación"]
+    ) or ("ingreso" in p and ("pago" in p or "pagado" in p))
 
     if "venta" in p or "ventas" in p:
         metricas.append("- ventas = dp.cantidad * dp.precio_unitario * (1 - dp.descuento)")
 
-    if "margen" in p:
-        metricas.append("- margen = ventas - dp.cantidad * pr.costo")
+    if pide_rentabilidad:
+        metricas.append("- rentabilidad/margen = SUM(dp.cantidad * ((dp.precio_unitario * (1 - dp.descuento)) - pr.costo))")
 
     if "stock" in p:
         metricas.append("- stock bajo = i.stock < i.stock_minimo")
 
     if "pago" in p or "monto" in p:
         metricas.append("- monto vendido por metodo = SUM(pa.monto)")
+
+    if pide_cobros and not pide_rentabilidad:
+        metricas.append("- cobros/facturación = SUM(pa.monto) desde pagos pa con pa.estado = 'pagado'")
 
     if "pedido" in p and ("canal" in p or "estado" in p) and "pago" not in p:
         metricas.append("- pedidos por canal/estado = COUNT(*) desde pedidos pe, sin unir pagos")
@@ -541,9 +736,24 @@ def generar_sql_modelo(pregunta, contexto_esquema, sql_previo=None, error_previo
         error_previo=error_previo
     )
     respuesta = llamar_ollama(prompt)
-    sql = normalizar_aliases_sql(limpiar_sql(respuesta))
-    sql = eliminar_joins_no_usados(sql)
-    return sql, respuesta
+    return preparar_sql_para_pregunta(pregunta, respuesta), respuesta
+
+
+def corregir_sql_modelo(pregunta, contexto_esquema, sql_fallido, error_detectado):
+    sql_preparado = preparar_sql_para_pregunta(pregunta, sql_fallido or "")
+    ok_preparado, error_preparado = validar_sql_detallado(pregunta, sql_preparado)
+
+    if ok_preparado:
+        return sql_preparado, "Corrección determinística"
+
+    prompt = construir_prompt_corrector(
+        pregunta,
+        contexto_esquema,
+        sql_preparado or sql_fallido,
+        f"{error_detectado}. Revisión local: {error_preparado}"
+    )
+    respuesta = llamar_ollama(prompt, max_tokens=190)
+    return preparar_sql_para_pregunta(pregunta, respuesta), respuesta
 
 
 def generar_sql(pregunta):
@@ -650,15 +860,24 @@ def procesar_pregunta(pregunta, forzar_ia=False):
         "ejecucion_bd": 0,
     }
     validaciones_ok = []
+    modo_actual = "generacion"
 
     for intento in range(1, MAX_INTENTOS + 1):
         inicio_generacion = time.time()
-        sql_actual, respuesta_modelo = generar_sql_modelo(
-            pregunta,
-            contexto_esquema,
-            sql_previo=sql_actual,
-            error_previo=error_actual
-        )
+        if intento == 1:
+            sql_actual, respuesta_modelo = generar_sql_modelo(
+                pregunta,
+                contexto_esquema
+            )
+            modo_actual = "generacion"
+        else:
+            sql_actual, respuesta_modelo = corregir_sql_modelo(
+                pregunta,
+                contexto_esquema,
+                sql_actual,
+                error_actual
+            )
+            modo_actual = "correccion"
         tiempos["generacion_sql"] += time.time() - inicio_generacion
 
         inicio_validacion = time.time()
@@ -666,7 +885,11 @@ def procesar_pregunta(pregunta, forzar_ia=False):
         tiempos["validacion"] += time.time() - inicio_validacion
         metadata = {
             "sql": sql_actual,
-            "origen": f"IA ({MODELO_SQL}) intento {intento}",
+            "origen": (
+                f"IA ({MODELO_SQL}) intento {intento}"
+                if modo_actual == "generacion"
+                else f"IA correctora ({MODELO_SQL}) intento {intento}"
+            ),
             "contexto": contexto_esquema,
             "respuesta_modelo": respuesta_modelo
         }
@@ -681,6 +904,8 @@ def procesar_pregunta(pregunta, forzar_ia=False):
                 "Tablas y columnas válidas",
                 "Reglas de negocio verificadas",
             ]
+            if modo_actual == "correccion":
+                validaciones_ok.append("Autocorrección aplicada")
 
             inicio_bd = time.time()
             resultado = ejecutar_sql(sql_actual)
@@ -691,13 +916,21 @@ def procesar_pregunta(pregunta, forzar_ia=False):
 
             cache_sql[pregunta_cache] = {
                 "sql": sql_actual,
-                "origen": f"IA ({MODELO_SQL})",
+                "origen": (
+                    f"IA ({MODELO_SQL})"
+                    if modo_actual == "generacion"
+                    else f"IA correctora ({MODELO_SQL})"
+                ),
                 "contexto": contexto_esquema
             }
             guardar_cache_persistente(
                 pregunta,
                 sql_actual,
-                f"IA ({MODELO_SQL})",
+                (
+                    f"IA ({MODELO_SQL})"
+                    if modo_actual == "generacion"
+                    else f"IA correctora ({MODELO_SQL})"
+                ),
                 contexto_esquema
             )
 

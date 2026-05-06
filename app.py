@@ -5,7 +5,7 @@ from decimal import Decimal
 import pandas as pd
 import streamlit as st
 
-from agente_sql import calentar_modelo, ejecutar_sql, get_conn, guardar_correccion_usuario, procesar_pregunta
+from agente_sql import calentar_modelo, ejecutar_sql, get_conn, procesar_pregunta
 from db_setup import crear_esquema_y_cargar_datos
 
 
@@ -212,27 +212,6 @@ def mostrar_resultado(item, key):
         mostrar_visualizacion(df)
 
 
-def mostrar_aprendizaje_supervisado(item, key):
-    st.caption("Si la interpretación no fue correcta, guarda el SQL correcto para esta pregunta.")
-    sql_corregido = st.text_area(
-        "SQL corregido",
-        value=item.get("sql", ""),
-        height=180,
-        key=f"sql_corregido_{key}"
-    )
-
-    if st.button("Guardar corrección", key=f"guardar_correccion_{key}"):
-        resultado = guardar_correccion_usuario(item["pregunta"], sql_corregido)
-
-        if resultado["ok"]:
-            st.success("Corrección guardada. La próxima ejecución usará esta consulta validada.")
-            st.code(resultado["sql"], language="sql")
-        else:
-            st.error("No se pudo guardar la corrección")
-            st.caption(resultado["error"])
-            st.code(resultado.get("sql", sql_corregido), language="sql")
-
-
 def mostrar_estado_agente(item):
     tiempos = item.get("tiempos", {})
     validaciones = item.get("validaciones", [])
@@ -249,13 +228,15 @@ def mostrar_estado_agente(item):
 def nombre_origen(origen):
     origen = origen or "IA"
 
-    if "corrección" in origen.lower():
-        return "Corrección supervisada"
+    origen_limpio = origen.lower()
 
-    if "cache" in origen or "memoria" in origen:
+    if "corrección" in origen_limpio or "correctora" in origen_limpio:
+        return "Consulta ajustada automáticamente"
+
+    if "cache" in origen_limpio or "memoria" in origen_limpio:
         return "Memoria validada del agente"
 
-    if "IA" in origen:
+    if "ia" in origen_limpio:
         return "Generado por IA local"
 
     return origen
@@ -336,6 +317,7 @@ if ejecutar:
             st.write("Seleccionando esquema relevante")
             st.write("Generando SQL con modelo local")
             st.write("Validando seguridad, tablas y columnas")
+            st.write("Corrigiendo automáticamente si detecta inconsistencias")
             st.write("Ejecutando consulta en PostgreSQL")
 
             respuesta = procesar_pregunta(pregunta)
@@ -407,6 +389,3 @@ else:
             with st.expander("Ver detalle técnico"):
                 st.caption(f"Origen técnico: {item.get('origen', 'IA')}")
                 st.code(item["sql"], language="sql")
-
-            with st.expander("Corregir interpretación"):
-                mostrar_aprendizaje_supervisado(item, i)
