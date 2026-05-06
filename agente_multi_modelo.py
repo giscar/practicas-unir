@@ -4,13 +4,15 @@ import re
 import time
 import traceback
 
+from db_setup import construir_contexto_esquema
+
 print(">>> SISTEMA DINÁMICO OPTIMIZADO")
 
 # ---------------------------
 # CONFIG
 # ---------------------------
 URL_OLLAMA = "http://localhost:11434/api/generate"
-MODELO_SQL = "llama3"
+MODELO_SQL = "qwen2.5-coder:1.5b"
 
 cache_sql = {}
 
@@ -43,16 +45,18 @@ def ejecutar_sql(query):
 # ---------------------------
 # OLLAMA
 # ---------------------------
-def llamar_ollama(prompt, temperature=0, max_tokens=25):
+def llamar_ollama(prompt, temperature=0, max_tokens=220):
     response = requests.post(
         URL_OLLAMA,
+        timeout=45,
         json={
             "model": MODELO_SQL,
             "prompt": prompt,
             "stream": False,
             "options": {
                 "temperature": temperature,
-                "num_predict": max_tokens
+                "num_predict": max_tokens,
+                "num_ctx": 1024
             }
         }
     )
@@ -95,6 +99,8 @@ def generar_sql(pregunta):
     if pregunta in cache_sql:
         return cache_sql[pregunta]
 
+    contexto_esquema = construir_contexto_esquema(pregunta)
+
     prompt = f"""
 SQL PostgreSQL.
 
@@ -108,16 +114,13 @@ IMPORTANTE:
 - Incluye TODAS las tablas necesarias
 - NO omitas joins
 
-Esquema:
-clientes(id,nombre,ciudad,fecha_registro)
-productos(id,nombre,precio,categoria)
-pedidos(id,cliente_id,fecha)
-detalle_pedido(id,pedido_id,producto_id,cantidad)
+{contexto_esquema}
 
-Relaciones:
-pedidos.cliente_id=clientes.id
-detalle_pedido.pedido_id=pedidos.id
-detalle_pedido.producto_id=productos.id
+Notas de negocio:
+- Ventas = detalle_pedido.cantidad * detalle_pedido.precio_unitario * (1 - detalle_pedido.descuento).
+- Margen = ventas - detalle_pedido.cantidad * productos.costo.
+- Usa JOINs correctos cuando cruces tablas.
+- Para rankings usa ORDER BY y LIMIT.
 
 Pregunta: {pregunta}
 """
@@ -132,6 +135,8 @@ Pregunta: {pregunta}
 # REGENERAR SQL (SIN CACHE)
 # ---------------------------
 def regenerar_sql(pregunta):
+    contexto_esquema = construir_contexto_esquema(pregunta)
+
     prompt = f"""
 SQL PostgreSQL.
 
@@ -144,6 +149,8 @@ IMPORTANTE:
 - Usa JOINs correctos
 - Incluye TODAS las tablas necesarias
 - NO omitas joins
+- Usa el siguiente esquema:
+{contexto_esquema}
 
 Pregunta: {pregunta}
 """

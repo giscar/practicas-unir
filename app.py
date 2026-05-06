@@ -4,7 +4,8 @@ import time
 from datetime import datetime
 
 # IMPORTA TU AGENTE
-from agente_sql import generar_sql, ejecutar_sql, validar_sql
+from agente_sql import get_conn, procesar_pregunta
+from db_setup import crear_esquema_y_cargar_datos
 
 # ---------------------------
 # CONFIGURACIÓN
@@ -24,17 +25,65 @@ st.markdown("Consulta tu base de datos en lenguaje natural")
 if "historial" not in st.session_state:
     st.session_state.historial = []
 
+
+def mostrar_resultado(resultado, key):
+    if isinstance(resultado, str):
+        st.error(resultado)
+        return
+
+    if not resultado:
+        st.info("Sin resultados")
+        return
+
+    if len(resultado) == 1 and len(resultado[0]) == 1:
+        st.metric("Resultado", resultado[0][0])
+        return
+
+    columnas = [f"columna_{i + 1}" for i in range(len(resultado[0]))]
+    df = pd.DataFrame(resultado, columns=columnas)
+
+    st.dataframe(df, use_container_width=True)
+
+    csv = df.to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        label="📥 Descargar resultados (CSV)",
+        data=csv,
+        file_name=f"consulta_{key}.csv",
+        mime="text/csv",
+        key=f"download_{key}"
+    )
+
 # ---------------------------
 # INPUT
 # ---------------------------
 with st.container():
-    col1, col2 = st.columns([4,1])
+    col1, col2, col3, col4 = st.columns([4, 1, 1, 1])
 
     with col1:
         pregunta = st.text_input("❓ Escribe tu pregunta")
 
     with col2:
         ejecutar = st.button("Consultar")
+
+    with col3:
+        limpiar = st.button("Limpiar historial")
+
+    with col4:
+        cargar_demo = st.button("Cargar datos demo")
+
+if limpiar:
+    st.session_state.historial = []
+    st.rerun()
+
+if cargar_demo:
+    with st.spinner("📦 Creando modelo empresarial y cargando datos..."):
+        resumen = crear_esquema_y_cargar_datos(get_conn)
+        st.session_state.historial = []
+        st.success(
+            "✅ Datos demo cargados: "
+            + ", ".join(f"{tabla}: {total}" for tabla, total in resumen.items())
+        )
 
 # ---------------------------
 # PROCESAMIENTO
@@ -49,23 +98,21 @@ if ejecutar:
             inicio = time.time()
 
             try:
-                # 1. Generar SQL
-                sql = generar_sql(pregunta)
+                respuesta = procesar_pregunta(pregunta)
 
-                # 2. Validar
-                if not validar_sql(sql):
-                    st.error("❌ SQL inválido generado")
+                if not respuesta["ok"]:
+                    st.error("❌ No se pudo resolver la consulta")
+                    st.code(respuesta["sql"], language="sql")
+                    st.caption(respuesta.get("error", "Error desconocido"))
                 else:
-                    # 3. Ejecutar
-                    resultado = ejecutar_sql(sql)
-
                     fin = time.time()
 
                     # Guardar en historial
                     st.session_state.historial.append({
                         "pregunta": pregunta,
-                        "sql": sql,
-                        "resultado": resultado,
+                        "sql": respuesta["sql"],
+                        "origen": respuesta["origen"],
+                        "resultado": respuesta["resultado"],
                         "tiempo": round(fin - inicio, 2),
                         "timestamp": datetime.now().strftime("%H:%M:%S")
                     })
@@ -100,28 +147,12 @@ else:
         with col2:
             st.metric("⏱ Tiempo", f"{item['tiempo']} s")
 
+        st.caption(f"Origen SQL: {item.get('origen', 'IA')}")
+
         # ---------------------------
         # RESULTADO
         # ---------------------------
-        if isinstance(item["resultado"], str):
-            st.error(item["resultado"])
-        else:
-            df = pd.DataFrame(item["resultado"])
-
-            st.dataframe(df, use_container_width=True)
-
-            # ---------------------------
-            # DESCARGA (FIX ERROR)
-            # ---------------------------
-            csv = df.to_csv(index=False).encode('utf-8')
-
-            st.download_button(
-                label="📥 Descargar resultados (CSV)",
-                data=csv,
-                file_name=f"consulta_{i}.csv",
-                mime="text/csv",
-                key=f"download_{i}"  # 🔥 CLAVE ÚNICA
-            )
+        mostrar_resultado(item["resultado"], i)
 
         # ---------------------------
         # SQL VISIBLE
